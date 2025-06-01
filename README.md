@@ -39,7 +39,7 @@ A lightweight, privacy-focused temporary email client built with the official [M
 
 **Local Development**
 ```bash
-git clone https://github.com/yourusername/tempmail.git
+git clone https://github.com/agaggsgsfsfwcau/tempmail.git
 cd tempmail
 open index.html
 ```
