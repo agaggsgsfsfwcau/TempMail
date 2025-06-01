@@ -410,7 +410,35 @@
     let refreshTimeout = null;
     let progressInterval = null;
 
-    document.addEventListener('DOMContentLoaded', generateRandomMail);
+    // Load saved state from localStorage
+    document.addEventListener('DOMContentLoaded', function() {
+      // Load dark mode preference
+      if (localStorage.getItem('darkMode') === 'enabled') {
+        document.body.classList.add('dark-mode');
+        const icon = document.querySelector('button[onclick="toggleDarkMode()"] .material-icons');
+        if (icon) icon.textContent = 'brightness_7';
+      }
+
+      // Load email if exists
+      const savedEmail = localStorage.getItem('tempMailEmail');
+      const savedToken = localStorage.getItem('tempMailToken');
+      
+      if (savedEmail && savedToken) {
+        email = savedEmail;
+        token = savedToken;
+        document.getElementById('email').innerHTML = `
+          <span>${email}</span>
+          <button class="outlined" onclick="copyEmail(event)" style="padding: 6px 12px;">
+            <span class="material-icons">content_copy</span>
+            Copy
+          </button>
+        `;
+        refreshInbox();
+        startAutoRefresh();
+      } else {
+        generateRandomMail();
+      }
+    });
 
     async function generateRandomMail() {
       try {
@@ -419,28 +447,55 @@
         if (progressInterval) clearInterval(progressInterval);
         document.getElementById('inbox').innerHTML = '<div class="empty-inbox">Loading your messages...</div>';
 
+        // First, try to get available domains
         const domainsRes = await fetch('https://api.mail.tm/domains');
+        if (!domainsRes.ok) {
+          throw new Error('Failed to fetch domains');
+        }
+        
         const domainsData = await domainsRes.json();
-        const domain = domainsData['hydra:member'][0].domain;
-
-        const randomString = Math.random().toString(36).substring(2, 8);
+        const availableDomains = domainsData['hydra:member'];
+        
+        if (!availableDomains || availableDomains.length === 0) {
+          throw new Error('No domains available');
+        }
+        
+        // Select the first available domain
+        const domain = availableDomains[0].domain;
+        const randomString = Math.random().toString(36).substring(2, 10);
         email = `${randomString}@${domain}`;
         password = generateStrongPassword();
 
-        await fetch('https://api.mail.tm/accounts', {
+        // Create the account
+        const accountRes = await fetch('https://api.mail.tm/accounts', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ address: email, password })
         });
+        
+        if (!accountRes.ok) {
+          const errorData = await accountRes.json();
+          throw new Error(errorData.message || 'Account creation failed');
+        }
 
+        // Get the token
         const loginRes = await fetch('https://api.mail.tm/token', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ address: email, password })
         });
-
+        
+        if (!loginRes.ok) {
+          const errorData = await loginRes.json();
+          throw new Error(errorData.message || 'Login failed');
+        }
+        
         const loginData = await loginRes.json();
         token = loginData.token;
+
+        // Save to localStorage
+        localStorage.setItem('tempMailEmail', email);
+        localStorage.setItem('tempMailToken', token);
 
         document.getElementById('email').innerHTML = `
           <span>${email}</span>
@@ -455,7 +510,44 @@
         startAutoRefresh();
 
       } catch (error) {
-        showSnackbar(`Error: ${error.message}`, 'error');
+        console.error('Error generating email:', error);
+        showSnackbar(`Error: ${error.message || 'Failed to create email'}`, 'error');
+        
+        // Fallback to a hardcoded domain if API fails
+        if (error.message.includes('domains') || error.message.includes('domain')) {
+          showSnackbar('Using fallback domain', 'warning');
+          const fallbackDomain = 'mail.tm';
+          const randomString = Math.random().toString(36).substring(2, 10);
+          email = `${randomString}@${fallbackDomain}`;
+          password = generateStrongPassword();
+          
+          // Try to proceed with the fallback domain
+          try {
+            const loginRes = await fetch('https://api.mail.tm/token', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ address: email, password })
+            });
+            
+            if (loginRes.ok) {
+              const loginData = await loginRes.json();
+              token = loginData.token;
+              localStorage.setItem('tempMailEmail', email);
+              localStorage.setItem('tempMailToken', token);
+              document.getElementById('email').innerHTML = `
+                <span>${email}</span>
+                <button class="outlined" onclick="copyEmail(event)" style="padding: 6px 12px;">
+                  <span class="material-icons">content_copy</span>
+                  Copy
+                </button>
+              `;
+              refreshInbox();
+              startAutoRefresh();
+            }
+          } catch (fallbackError) {
+            showSnackbar('Failed to use fallback domain', 'error');
+          }
+        }
       }
     }
 
@@ -481,13 +573,26 @@
 
     async function refreshInbox() {
       if (!token) return;
+      
       try {
         const inboxRes = await fetch('https://api.mail.tm/messages', {
-          headers: { Authorization: `Bearer ${token}` }
+          headers: { 
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          }
         });
 
+        if (!inboxRes.ok) {
+          // If unauthorized, try to get a new token
+          if (inboxRes.status === 401) {
+            await refreshToken();
+            return refreshInbox(); // Retry after token refresh
+          }
+          throw new Error(`HTTP error! status: ${inboxRes.status}`);
+        }
+
         const inboxData = await inboxRes.json();
-        const messages = inboxData['hydra:member'];
+        const messages = inboxData['hydra:member'] || [];
         const inboxDiv = document.getElementById('inbox');
 
         const newMessageIds = messages.map(m => m.id);
@@ -503,7 +608,9 @@
           return;
         }
 
+        // Sort messages by date (newest first)
         messages.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+        
         inboxDiv.innerHTML = messages.map(msg => `
           <div class="email-box">
             <div class="email-header">
@@ -530,7 +637,43 @@
 
       } catch (err) {
         console.error('Inbox Error:', err);
-        showSnackbar('Error refreshing inbox', 'error');
+        showSnackbar('Error refreshing inbox. Retrying...', 'error');
+        
+        // If token is invalid, clear storage and generate new email
+        if (err.message.includes('401')) {
+          localStorage.removeItem('tempMailEmail');
+          localStorage.removeItem('tempMailToken');
+          generateRandomMail();
+        }
+      }
+    }
+
+    async function refreshToken() {
+      try {
+        if (!email || !password) {
+          throw new Error('No credentials available to refresh token');
+        }
+        
+        const loginRes = await fetch('https://api.mail.tm/token', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ address: email, password })
+        });
+        
+        if (!loginRes.ok) {
+          throw new Error('Token refresh failed');
+        }
+        
+        const loginData = await loginRes.json();
+        token = loginData.token;
+        localStorage.setItem('tempMailToken', token);
+        showSnackbar('Session refreshed', 'success');
+        return true;
+      } catch (err) {
+        console.error('Token refresh error:', err);
+        showSnackbar('Session expired. Generating new email...', 'error');
+        generateRandomMail();
+        return false;
       }
     }
 
@@ -545,6 +688,10 @@
         });
 
         if (!res.ok) {
+          if (res.status === 401) {
+            await refreshToken();
+            return showFullMessage(id, btn); // Retry after token refresh
+          }
           throw new Error('Failed to fetch message');
         }
 
@@ -625,6 +772,8 @@
       if (!email) return;
       navigator.clipboard.writeText(email).then(() => {
         showSnackbar('Email copied to clipboard!', 'success');
+      }).catch(err => {
+        showSnackbar('Failed to copy email', 'error');
       });
     }
 
@@ -632,6 +781,13 @@
       document.body.classList.toggle('dark-mode');
       const icon = document.querySelector('button[onclick="toggleDarkMode()"] .material-icons');
       icon.textContent = document.body.classList.contains('dark-mode') ? 'brightness_7' : 'brightness_4';
+      
+      // Save preference to localStorage
+      if (document.body.classList.contains('dark-mode')) {
+        localStorage.setItem('darkMode', 'enabled');
+      } else {
+        localStorage.removeItem('darkMode');
+      }
     }
 
     function formatDate(date) {
@@ -652,10 +808,19 @@
       const icon = document.getElementById('snackbarIcon');
       const message = document.getElementById('snackbarMessage');
       
+      // Set appropriate icon based on type
+      if (type === 'success') {
+        icon.textContent = 'check_circle';
+      } else if (type === 'error') {
+        icon.textContent = 'error';
+      } else if (type === 'warning') {
+        icon.textContent = 'warning';
+      } else {
+        icon.textContent = 'info';
+      }
+      
       snackbar.className = 'snackbar';
       snackbar.classList.add(type);
-      
-      icon.textContent = type === 'success' ? 'check_circle' : 'error';
       message.textContent = msg;
       
       snackbar.classList.add('show');
