@@ -34,7 +34,7 @@ A lightweight, privacy-focused temporary email client built with the official [M
 ## 🚀 Quick Start
 
 **Browser Usage**
-1. Visit the [Live Demo](https://agaggsgsfsfwcau.github.io/tempmail/)
+1. Visit the [Live Demo](https://tempmail-io.vercel.app/)
 2. Start using immediately - no installation needed
 
 **Local Development**
